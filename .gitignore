@@ -1,0 +1,42 @@
+# Secrets — never commit
+pull-secret
+pull-secret.*
+*.pullsecret
+install-config.yaml
+install-config.yaml.bak
+.env
+.env.*
+*.secret
+credentials
+credentials.*
+
+# OpenShift installer artifacts (contain kubeadmin password + kubeconfig)
+auth/
+**/auth/
+*.kubeconfig
+kubeconfig
+kubeconfig.*
+metadata.json
+terraform.*
+.openshift_install*
+
+# SSH keys
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.pem
+*.key
+
+# Cloud CLI / tooling state
+.azure/
+.aws/
+.kube/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
