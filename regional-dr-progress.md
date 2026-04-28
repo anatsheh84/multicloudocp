@@ -644,7 +644,151 @@ mirror sync.
 
 ---
 
-## 11. README documentation (in the workload repo)
+## 11. Azure cluster provisioning failed — wrong VM family / quota exhausted
+
+### Symptom
+
+A new managed cluster `ocpaz1` was created from the ACM hub UI on Azure
+(`eastus`). After ~71 minutes the Hive `ClusterDeployment` flipped to
+`ProvisionStopped` with reason `InstallAttemptsLimitReached`. The provision
+pod `ocpaz1-0-zckm4-provision-5jnvx` exited with status `Error` (exit
+code 6 from `openshift-install`).
+
+The hub's `ClusterDeployment` status told us the high-level cause:
+
+```
+ProvisionFailed   reason=NoWorkerNodesReady
+                  msg="0 worker nodes have joined the cluster"
+ProvisionStopped  reason=InstallAttemptsLimitReached
+                  msg="Install attempts limit reached"
+```
+
+### Root cause (Azure side, confirmed via `az` CLI)
+
+Three master VMs `ocpaz1-pxn8k-master-{0,1,2}` came up cleanly on
+`Standard_D4s_v3` (one per AZ). All three worker VM creations failed at
+09:33:16–09:33:19 UTC with this Azure error:
+
+```
+{
+  "code": "OperationNotAllowed",
+  "message": "Operation could not be completed as it results in exceeding
+              approved standardDCSv2Family Cores quota.
+              Location: eastus, Current Limit: 2, Current Usage: 0,
+              Additional Required: 4, (Minimum) New Limit Required: 4."
+}
+```
+
+Two layered problems:
+
+1. **Wrong VM family**: the install config / MachinePool selected a worker
+   `vmSize` from the **`Standard_DCsv2`** family — Azure's
+   *Confidential Computing* (Intel SGX) family. This is the wrong default
+   for general-purpose OpenShift workers; it's a specialty SKU for
+   enclave-isolated workloads. Most subscriptions have near-zero quota
+   for it by default.
+2. **Quota: 2 cores limit**: the subscription's `standardDCSv2Family Cores`
+   quota in eastus was capped at **2 cores** — not even enough for a
+   single 4-core worker. Three worker creates ran in parallel, all hit the
+   same denial, none could proceed. Masters were unaffected because they
+   used a *different* family (`standardDSv3Family`), which had sufficient
+   headroom.
+
+Cascade: 0 workers Ready → ingress controller has nowhere to schedule its
+router pods → routes (console, oauth, image-registry) can't be admitted →
+`authentication`, `console`, `ingress`, `machine-api`, `monitoring`,
+`image-registry` all stay Degraded → `openshift-install` 40-minute
+"wait-for-cluster-init" timer expires → exit 6 → Hive marks
+`ProvisionStopped`.
+
+The 3 masters were still billing in eastus after the install gave up,
+since Hive's deprovision is only triggered by deleting the
+`ClusterDeployment`.
+
+### Resolution
+
+For Azure on this subscription, **use `Standard Dv3 Family vCPUs` or
+`Standard Dv4 Family vCPUs`** as the worker SKU family. These are the
+general-purpose families OpenShift expects, both have substantial default
+quota in `eastus`, and they match what the masters already successfully
+used.
+
+Concretely, set the worker `vmSize` to one of:
+
+| Family | Recommended SKU | vCPU / RAM | Notes |
+|---|---|---|---|
+| Dv3 | `Standard_D4s_v3` | 4 / 16 GB | Same family as the masters; tested and works on this subscription |
+| Dv3 | `Standard_D8s_v3` | 8 / 32 GB | If workers will run heavier workloads |
+| Dv4 | `Standard_D4s_v4` | 4 / 16 GB | Newer hardware, slightly better price/perf |
+| Dv4 | `Standard_D8s_v4` | 8 / 32 GB | Larger workers on Dv4 |
+
+Avoid (without an explicit Confidential Computing requirement and a quota
+increase request approved):
+
+- `Standard_DC*s_v2` — Confidential Computing (the family that failed)
+- `Standard_DC*s_v3` — Confidential Computing v3
+- Any non-`s` SKU lacking premium-disk support (RHCOS needs premium SSD)
+
+In ACM hub UI, configure this on the `MachinePool` for workers, or in the
+install-config YAML used to create the `ClusterDeployment`. For
+declarative use, `MachinePool.spec.platform.azure.osDisk.diskSizeGB` and
+`MachinePool.spec.platform.azure.type` are the relevant fields:
+
+```yaml
+apiVersion: hive.openshift.io/v1
+kind: MachinePool
+metadata:
+  name: ocpaz1-worker
+  namespace: ocpaz1
+spec:
+  clusterDeploymentRef:
+    name: ocpaz1
+  name: worker
+  platform:
+    azure:
+      type: Standard_D4s_v3        # ← Dv3 family; Dv4 also fine: Standard_D4s_v4
+      zones: [ "1", "2", "3" ]
+      osDisk:
+        diskSizeGB: 128
+  replicas: 3
+```
+
+### Lesson / prevention
+
+1. **Verify VM family before any large Azure install.** Run
+   `az vm list-usage --location <region> -o table | grep -E "vCPU|Cores"`
+   to confirm there's headroom in whichever family you intend to use, in
+   the target region, on the target subscription. Workshop / sandbox /
+   trial subscriptions often have 2–10 core caps on non-default families.
+2. **Match worker family to master family by default.** If masters use
+   `Standard_D4s_v3` (Dv3) and you have no specific reason to differ,
+   keeping workers in the same family eliminates the "two separate
+   quota gauges" failure mode.
+3. **Don't pick `DCsv2` / `DCsv3` unless you actually need Confidential
+   Computing** for an enclave-protected workload. These families have
+   different licensing, lower availability across zones, and almost
+   always require a manual quota increase request in workshop
+   subscriptions.
+4. **Read Hive's `ClusterDeployment` conditions early.** The
+   `ProvisionFailed=True / NoWorkerNodesReady` condition appears within
+   ~30 minutes of an install starting; you don't need to wait the full
+   71 minutes. A daily check (or alert) on
+   `oc get clusterdeployment -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {range .status.conditions[?(@.type=="ProvisionFailed")]}{.status} {.reason}{"\n"}{end}{end}'`
+   surfaces in-progress install issues before the install-attempts limit
+   is exhausted.
+5. **Activity log first when an Azure install fails.** Running
+   `az monitor activity-log list --resource-group <rg> --status Failed`
+   against the install resource group (`<cluster>-<infraID>-rg`) returns
+   the exact Azure-side denial message — quota, SKU availability,
+   networking, RBAC, etc. Faster than trawling the install pod log.
+6. **Dispose of leftover masters when an install fails.** If you don't
+   plan to retry the same `ClusterDeployment`, delete it on the hub —
+   that triggers Hive's deprovision and stops the Azure billing on the
+   3 master VMs that did succeed.
+
+---
+
+## 12. README documentation (in the workload repo)
 
 The workload repo at `https://github.com/anatsheh84/k8s-pacman-app` now
 carries a "Deploying under ACM Regional-DR" section in `README.md`
@@ -686,4 +830,5 @@ cf2a62d Pin namespace SCC annotations for Regional-DR
 | 8 | UID drift across clusters | OpenShift assigns each namespace its own uid range; on-disk uid doesn't match new pod | Pin namespace SCC annotations identically on both clusters |
 | 9 | DR validation | — | End-to-end failover succeeded, data preserved across cluster switch |
 | 10 | Argo + DR Relocate | `prune=true` cascades during placement-decision drain | Disable prune, set `PrunePropagationPolicy=orphan`, set ApplicationSet `preserveResourcesOnDeletion=true` |
-| 11 | Documentation | Knowledge gap for next operator | README updates committed to workload repo |
+| 11 | Azure cluster install | Worker `vmSize` defaulted to `Standard_DCSv2` (Confidential Computing); subscription quota 2 cores → workers never created → install timed out | Use `Standard Dv3 Family vCPUs` or `Standard Dv4 Family vCPUs` for workers (e.g., `Standard_D4s_v3` / `Standard_D4s_v4`); verify quota with `az vm list-usage` before install |
+| 12 | Documentation | Knowledge gap for next operator | README updates committed to workload repo |
